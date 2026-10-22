@@ -2118,13 +2118,15 @@ fn clear_embedded_objects_for_stage_wipe(
     stage_idx: i64,
 ) {
     for (idx, obj) in list.iter_mut().enumerate() {
+        let has_explicit_slot = obj.nested_runtime_slot.is_some();
         let slot = obj.runtime_slot_or(idx);
         if config_button_trace_enabled_local() {
             eprintln!(
-                "[SG_DEBUG][CONFIG_BUTTON_TRACE][STAGE_WIPE] clear_embedded stage={} idx={} slot={} file={} used={} type={} backend={:?} disp={} pos=({}, {}) tr={} button_enabled={} button_no={} action_no={}",
+                "[SG_DEBUG][CONFIG_BUTTON_TRACE][STAGE_WIPE] clear_embedded stage={} idx={} slot={} explicit_slot={} file={} used={} type={} backend={:?} disp={} pos=({}, {}) tr={} button_enabled={} button_no={} action_no={}",
                 stage_idx,
                 idx,
                 slot,
+                has_explicit_slot,
                 obj.file_name.as_deref().unwrap_or("-"),
                 obj.used,
                 obj.object_type,
@@ -2138,7 +2140,11 @@ fn clear_embedded_objects_for_stage_wipe(
                 obj.button.action_no
             );
         }
-        object_clear_backend_recursive(ctx, obj, stage_idx, slot);
+        if has_explicit_slot {
+            object_clear_backend_recursive(ctx, obj, stage_idx, slot);
+        } else if !matches!(obj.backend, ObjectBackend::Gfx) {
+            object_clear_backend_recursive(ctx, obj, stage_idx, slot);
+        }
     }
     list.clear();
 }
@@ -2395,12 +2401,19 @@ fn stage_wipe_object_lists(
             }
             copy_root_object_for_stage_wipe(ctx, st, 2, idx, &front);
 
-            if object_wipe_copy_value(ctx, &front) == 0
-                && (back_prepared
-                    || object_wipe_erase_value(ctx, &back) == 1
-                    || object_wipe_erase_value(ctx, &front) == 1)
-            {
+            let should_promote_back = if back_prepared {
+                object_wipe_copy_value(ctx, &front) == 0
+            } else {
+                object_wipe_erase_value(ctx, &back) == 1
+                    || object_wipe_erase_value(ctx, &front) == 1
+                    || (end_order == i32::MAX && object_wipe_copy_value(ctx, &front) == 0)
+            };
+
+            if should_promote_back {
                 copy_root_object_for_stage_wipe(ctx, st, 1, idx, &back);
+                let list = st.object_lists.get_mut(&0).unwrap();
+                clear_root_object_for_stage_wipe(ctx, list, 0, idx);
+            } else if back_prepared {
                 let list = st.object_lists.get_mut(&0).unwrap();
                 clear_root_object_for_stage_wipe(ctx, list, 0, idx);
             }

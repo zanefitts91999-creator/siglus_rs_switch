@@ -1054,6 +1054,7 @@ impl CommandContext {
         };
         self.globals.finish_wipe();
         crate::runtime::forms::stage::reinit_wipe_next_stage(self, stage_form_id);
+        self.failed_gfx_image_repairs.clear();
     }
 
     pub fn notify_wait_key(&mut self) -> bool {
@@ -6714,6 +6715,7 @@ impl CommandContext {
         if !self.selbtn_accepts_input() {
             return;
         }
+        self.failed_gfx_image_repairs.clear();
         self.globals.selbtn.result = result;
         self.globals.selbtn.started = false;
         self.globals.selbtn.pressed_index = None;

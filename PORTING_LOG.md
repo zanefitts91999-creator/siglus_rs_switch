@@ -490,3 +490,38 @@ ender_wipe_to_display 的 common_prefix 完美衔接，转场前后立绘平滑�
   - **路径 1 (switch/siglus-switch.nro)**：回读哈希 32F3A40EC1E767F10145276C8B59690D0E4D1EBAD6BFFD188EC531333EEBCC66 (100% 一致)
   - **路径 2 (switch/siglus_rs/siglus-switch.nro)**：回读哈希 32F3A40EC1E767F10145276C8B59690D0E4D1EBAD6BFFD188EC531333EEBCC66 (100% 一致)
   - **实机部署结论**：已完成双路径原子写入与全量回读 SHA-256 比对校验，实机最新 Phase M14 修复固件部署就绪。
+
+---
+
+## Phase M15: 选项后背景立绘灭失终极修正 & 摇杆鼠标双模态事件彻底隔离 (Stage Wipe Promotion & Stick Mouse Isolation Fix)
+
+- **修改时间**：2026-10-22 23:30
+- **阶段版本**：Phase M15
+- **问题现象与具体缺陷表现**：
+  1. **选项后背景与人物双双灭失黑屏 (Issue 1 - M14 回归缺陷)**：在 M14 部署实机后，用户在选择选项后不仅立绘未恢复，连整个背景和人物都全部消失，呈现黑屏空舞台；
+  2. **摇杆控制鼠标时非目标选项高亮残留 (Issue 2)**：移动摇杆时光标附近的非指向选项或者上一次选中的选项仍频繁显示被选中效果（TNM_BTN_STATE_HIT）。
+
+- **底层根因剖析**：
+  1. **`stage_wipe_object_lists` 提升条件误判导致前台画面承接失败**：
+     - 在 `crates/siglus_scene_vm/src/runtime/forms/stage.rs:2398` 中，M14 引入的 `if object_wipe_copy_value(ctx, &front) == 0 && (back_prepared || erase)` 判定过窄；
+     - 选项选定后若未在后台准备新立绘或背景（`back_prepared == false`）且无显式 erase 指令，`copy_root_object_for_stage_wipe(ctx, st, 1, idx, &back)` 被直接跳过；
+     - 转场结束时 `reinit_wipe_next_stage` 释放了旧场景 Stage 2，而 Stage 1 未承接画面，导致前后台全空；
+  2. **嵌入式对象清理中 fallback slot 误清舞台根对象纹理**：
+     - 在 `clear_embedded_objects_for_stage_wipe` 中，嵌入对象若无 `nested_runtime_slot`，`runtime_slot_or(idx)` 会退化为 `idx`（0, 1...）；
+     - `object_clear_backend_recursive` 调用 `gfx.object_clear` 时误将舞台根槽位（0=背景，1=角色）的 GPU 纹理清空；
+  3. **虚拟鼠标模式下点击操作误向 VM 注入 Joypad 按键事件**：
+     - 在 `crates/siglus_scene_vm/src/switch_host.rs:327` 中，即使用户处于虚拟鼠标模式（`cursor_active == true`），`gamepad_button` 依然在调用 `mouse_down` 后无条件执行了 `self.host.joypad_button(button as usize, down)`；
+     - 这导致 VM 的 `input.joypad_mode_active` 被强制置为 `true`，`sync_selbtn_item_selection` 因而退化到手柄模式，无条件将 `self.globals.selbtn.cursor` 对应的选项强制点亮为 HIT 高亮态；
+     - 且在 `stick()` 驱动光标移动时未显式复位键盘/鼠标模态，导致移动过程中残留手柄高亮。
+
+- **具体修改方案与代码实现**：
+  1. **重构 `stage_wipe_object_lists` 中的 `should_promote_back` 严密判定**：
+     - 若 `back_prepared == true`：当 `wipe_copy == 0` 时提升至 Stage 1；
+     - 若 `back_prepared == false`：仅在显式请求 `erase == 1` 或属于全屏切场景（`end_order == i32::MAX && wipe_copy == 0`）时才清除，常规局部转场与选项切换 100% 留存前台存活角色与背景；
+  2. **嵌入式对象清理增加 `has_explicit_slot` 安全守卫**：
+     - 在 `clear_embedded_objects_for_stage_wipe` 中，仅对拥有 `nested_runtime_slot.is_some()` 的对象调用 Gfx 后端清理，对于无 explicit slot 的嵌入对象严禁调用 `gfx.object_clear`，彻底消除对根槽位的误伤；
+  3. **转场与选项结束时即时清除自愈黑名单**：
+     - 在 `finish_wipe_runtime` 与 `finish_selbtn` 中添加 `self.failed_gfx_image_repairs.clear()`，避免偶发延迟纹理被永久废弃；
+  4. **虚拟鼠标模态完全隔离与手柄按键拦截**：
+     - 在 `switch_host.rs:stick()` 中增加 `self.host.vm_mut().ctx.input.note_keyboard_mouse_activity()`，确保摇杆移动时实时保持为鼠标模态；
+     - 在 `switch_host.rs:gamepad_button()` 中增加 `if !self.cursor_active` 保护，虚拟鼠标激活时阻断 `joypad_button` 透传，彻底根除焦点抢占与高亮残留。

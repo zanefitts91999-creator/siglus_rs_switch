@@ -204,6 +204,7 @@ impl SwitchHost {
                 self.cursor_active = true;
                 self.cursor_last_active_tick = self.frame;
                 self.host.vm_mut().ctx.globals.script.cursor_runtime_visible = true;
+                self.host.vm_mut().ctx.input.note_keyboard_mouse_activity();
             }
         } else if stick == 1 {
             // Right Stick: Vertical wheel (Backlog scrolling)
@@ -324,7 +325,11 @@ impl SwitchHost {
         }
         // Keep the VM pump live for buttons which have no keyboard equivalent;
         // games can consume their raw JOY_BUTTON edge directly.
-        self.host.joypad_button(button as usize, down);
+        // When the virtual mouse cursor is active, mouse-mapped clicks (A/B) must not
+        // trigger joypad mode or fight virtual mouse selection.
+        if !self.cursor_active {
+            self.host.joypad_button(button as usize, down);
+        }
     }
 
     pub fn host_mut(&mut self) -> &mut SiglusHost {
