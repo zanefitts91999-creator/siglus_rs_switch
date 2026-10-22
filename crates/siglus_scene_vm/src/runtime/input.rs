@@ -224,7 +224,7 @@ impl InputState {
         }
     }
 
-    fn note_keyboard_mouse_activity(&mut self) {
+    pub fn note_keyboard_mouse_activity(&mut self) {
         self.joypad_mode_active = false;
     }
 
