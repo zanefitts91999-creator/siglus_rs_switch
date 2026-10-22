@@ -525,3 +525,19 @@ ender_wipe_to_display 的 common_prefix 完美衔接，转场前后立绘平滑�
   4. **虚拟鼠标模态完全隔离与手柄按键拦截**：
      - 在 `switch_host.rs:stick()` 中增加 `self.host.vm_mut().ctx.input.note_keyboard_mouse_activity()`，确保摇杆移动时实时保持为鼠标模态；
      - 在 `switch_host.rs:gamepad_button()` 中增加 `if !self.cursor_active` 保护，虚拟鼠标激活时阻断 `joypad_button` 透传，彻底根除焦点抢占与高亮残留。
+
+- **构建与二进制实证校验**：
+  - **Commit**：[`d757412`](https://github.com/zanefitts91999-creator/siglus_rs_switch/commit/d757412)
+  - **GitHub Actions Run ID**：39796979970（Build Switch NRO (Optimized)，状态：Success）
+  - **Artifact ID**：12434371154 (siglus-switch-binaries)
+  - **NRO 二进制规格**：25,304,304 字节
+  - **权威 NRO SHA-256**：`C205EB4B1E52F1F41792843FEF1FF69881AD5C66A46DF1DD0F88E29F79A650FC`
+  - **ELF SHA-256**：`05C6F80B20C69D3B05AA6910F5B68A8024BE79CB59CFEA81BB575867529CD775`
+  - **MAP SHA-256**：`A8E26ACC8BAFB2BFE608D3F784BB00AAB55D6C0A18D133709136763AE18F7C50`
+  - **本地就绪文件**：[`D:\ns\v16_build\siglus-switch.nro`](file:///D:/ns/v16_build/siglus-switch.nro) 与 [`D:\ns\siglus-switch.nro`](file:///D:/ns/siglus-switch.nro)
+  - **实机部署脚本**：[`D:\ns\deploy_m15_to_switch.ps1`](file:///D:/ns/deploy_m15_to_switch.ps1)
+- **Switch MTP 实机部署与双路径回读哈希校验**：
+  - **部署时间**：2026-10-22 23:45
+  - **路径 1 (`switch/siglus-switch.nro`)**：回读哈希 `C205EB4B1E52F1F41792843FEF1FF69881AD5C66A46DF1DD0F88E29F79A650FC` (100% 一致)
+  - **路径 2 (`switch/siglus_rs/siglus-switch.nro`)**：回读哈希 `C205EB4B1E52F1F41792843FEF1FF69881AD5C66A46DF1DD0F88E29F79A650FC` (100% 一致)
+  - **实机部署结论**：已完成双路径原子写入与全量回读 SHA-256 比对校验，实机最新 Phase M15 修复固件部署就绪。
