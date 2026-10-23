@@ -9066,7 +9066,7 @@ impl<'a> SceneVm<'a> {
                 .as_ref()
                 .and_then(|pck| pck.find_scene_name(scn_no))
                 .map(ToOwned::to_owned)
-                .or_else(|| self.ctx.lookup_scene_name(scn_no as i64).ok().flatten())
+                .or_else(|| self.indexed_scene_name(scn_no as i32).ok())
             else {
                 continue;
             };
@@ -16106,271 +16106,203 @@ mod call_frame_save_metadata_tests {
     }
 
     #[test]
-    fn cross_scene_user_props_round_trip_in_save_stream() {
+    fn current_scene_user_props_round_trip_through_scene_prop_list_stream() {
         let chunk = Box::leak(empty_scene_chunk().into_boxed_slice());
         let stream = SceneStream::new(chunk).expect("empty scene stream");
-        let mut vm = SceneVm::new(stream, CommandContext::new(PathBuf::from(".")));
-        vm.current_scene_name = Some("010_プロローグ0702".to_string());
-        vm.ctx
-            .scene_names
-            .insert(454, "__lib_bs".to_string());
-
+        let vm = SceneVm::new(stream, CommandContext::new(PathBuf::from(".")));
         let shared = vm.shared_user_prop_count();
-        let prop_int_id = shared as u16;
-        let prop_intlist_id = (shared + 1) as u16;
-        let prop_strlist_id = (shared + 2) as u16;
 
         let mut cell_int = UserPropCell::new(
             vm.cfg.fm_int,
-            vm.default_user_prop_element(prop_int_id, vm.cfg.fm_int),
+            vm.default_user_prop_element(shared as u16, vm.cfg.fm_int),
         );
         cell_int.int_value = 1;
-
         let mut cell_intlist = UserPropCell::new(
             vm.cfg.fm_intlist,
-            vm.default_user_prop_element(prop_intlist_id, vm.cfg.fm_intlist),
+            vm.default_user_prop_element((shared + 1) as u16, vm.cfg.fm_intlist),
         );
         cell_intlist.int_list = vec![0, 500, 1000, 1500];
-
         let mut cell_strlist = UserPropCell::new(
             vm.cfg.fm_strlist,
-            vm.default_user_prop_element(prop_strlist_id, vm.cfg.fm_strlist),
+            vm.default_user_prop_element((shared + 2) as u16, vm.cfg.fm_strlist),
         );
         cell_strlist.str_list = vec!["sp13_24".to_string(), "sp11_13".to_string()];
 
-        let mut lib_bs_map = std::collections::BTreeMap::new();
-        lib_bs_map.insert(prop_int_id, cell_int);
-        lib_bs_map.insert(prop_intlist_id, cell_intlist);
-        lib_bs_map.insert(prop_strlist_id, cell_strlist);
-        vm.scene_user_props.insert(454, lib_bs_map);
+        let mut locals = BTreeMap::new();
+        locals.insert(shared as u16, cell_int);
+        locals.insert((shared + 1) as u16, cell_intlist);
+        locals.insert((shared + 2) as u16, cell_strlist);
 
+        // Without a scene stream declaration the list is built from the
+        // resident cells, keyed by their scene-local index.
+        let props = vm.build_scene_prop_list_for_stream(shared, None, &locals);
+        assert_eq!(
+            props.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
+            vec![0, 1, 2]
+        );
+
+        // Two scene records: one for an unknown scene (must be skipped without
+        // corrupting the stream) and one for the current scene.
         let mut writer = OriginalStreamWriter::new();
-        vm.write_cpp_current_scene_prop_lists(&mut writer);
+        writer.push_i32(2);
+        writer.push_str("__unknown_scene_without_pck");
+        writer.push_fixed_items(&props, |w, (id, cell)| vm.write_cpp_prop(w, *id, cell));
+        writer.push_str("010_プロローグ0702");
+        writer.push_fixed_items(&props, |w, (id, cell)| vm.write_cpp_prop(w, *id, cell));
+        writer.push_i32(0x5eed);
         let bytes = writer.into_inner();
 
         let chunk2 = Box::leak(empty_scene_chunk().into_boxed_slice());
         let stream2 = SceneStream::new(chunk2).expect("empty scene stream");
         let mut vm2 = SceneVm::new(stream2, CommandContext::new(PathBuf::from(".")));
-        vm2.current_scene_name = Some("010_プロローグ0702".to_string());
-        vm2.ctx
-            .scene_names
-            .insert(454, "__lib_bs".to_string());
-
         let mut reader = OriginalStreamReader::new(&bytes);
         vm2.read_cpp_scene_prop_lists(&mut reader, "010_プロローグ0702")
             .expect("read scene prop lists");
+        assert_eq!(reader.i32().unwrap(), 0x5eed, "record boundary preserved");
 
-        let restored_bs = vm2
-            .scene_user_props
-            .get(&454)
-            .expect("__lib_bs scene_user_props restored");
-        assert_eq!(restored_bs[&prop_int_id].int_value, 1);
+        assert_eq!(vm2.user_props[&(shared as u16)].int_value, 1);
         assert_eq!(
-            restored_bs[&prop_intlist_id].int_list,
+            vm2.user_props[&((shared + 1) as u16)].int_list,
             vec![0, 500, 1000, 1500]
         );
         assert_eq!(
-            restored_bs[&prop_strlist_id].str_list,
+            vm2.user_props[&((shared + 2) as u16)].str_list,
             vec!["sp13_24".to_string(), "sp11_13".to_string()]
         );
     }
+}
 
+#[cfg(test)]
+mod stage_wipe_regression_tests {
+    use super::*;
+    use crate::runtime::forms::codes::{self, ELM_ARRAY, ELM_INTLIST_RESIZE};
+    use crate::scene_stream::SceneStream;
+    use std::path::PathBuf;
+
+    fn empty_scene_chunk() -> Vec<u8> {
+        const HEADER_WORDS: usize = 33;
+        const HEADER_SIZE: i32 = (HEADER_WORDS * 4) as i32;
+        let mut words = [0i32; HEADER_WORDS];
+        for idx in [
+            0usize, 1, 3, 5, 7, 9, 11, 13, 15, 17, 19, 21, 23, 25, 27, 29, 31,
+        ] {
+            words[idx] = HEADER_SIZE;
+        }
+        let mut out = Vec::with_capacity(HEADER_SIZE as usize);
+        for word in words {
+            out.extend_from_slice(&word.to_le_bytes());
+        }
+        out
+    }
+
+    fn test_vm() -> SceneVm<'static> {
+        let chunk = Box::leak(empty_scene_chunk().into_boxed_slice());
+        let stream = SceneStream::new(chunk).expect("empty scene stream");
+        SceneVm::new(stream, CommandContext::new(PathBuf::from(".")))
+    }
+
+    fn object_chain(stage: i32, idx: i32) -> Vec<i32> {
+        vec![stage, codes::ELM_STAGE_OBJECT, ELM_ARRAY, idx]
+    }
+
+    fn stage_form(vm: &SceneVm<'_>) -> u32 {
+        if vm.ctx.ids.form_global_stage != 0 {
+            vm.ctx.ids.form_global_stage
+        } else {
+            codes::FORM_GLOBAL_STAGE
+        }
+    }
+
+    /// $$change_bs_face prepares the new expression on BACK while the old
+    /// standee on FRONT has WIPE_COPY=1. C_elm_stage_list::wipe() must still
+    /// promote the prepared BACK object (and its X_REP list) to FRONT.
     #[test]
-    fn stage_wipe_promotes_back_prepared_object_when_front_wipe_copy_is_one() {
-        use crate::runtime::forms::codes::{
-            STAGE_ELM_OBJECT, STAGE_OBJ_BACK, STAGE_OBJ_FRONT, object_op,
-        };
-        use crate::runtime::forms::stage::{dispatch_with_pos, stage_wipe_object_lists};
+    fn wipe_promotes_prepared_back_object_over_wipe_copy_front() {
+        let mut vm = test_vm();
+        let slot = 5;
 
-        let mut ctx = CommandContext::new(PathBuf::from("."));
-        let form_id = ctx.ids.form_global_stage;
-        let elm_array = ctx.ids.elm_array;
+        // FRONT[5].WIPE_COPY = 1 through the real assignment route.
+        let mut front_wipe_copy = object_chain(codes::ELM_GLOBAL_FRONT, slot);
+        front_wipe_copy.push(codes::ELM_OBJECT_WIPE_COPY);
+        vm.exec_assign(front_wipe_copy, 1, Value::Int(1))
+            .expect("FRONT[5].WIPE_COPY = 1");
 
-        // Resize FRONT and BACK object lists to 6
-        dispatch_with_pos(
-            &mut ctx,
-            form_id,
-            &[form_id as i32, elm_array, STAGE_OBJ_FRONT, 0],
-            4,
-            &[Value::Int(6)],
-            None,
-            None,
-            None,
-        )
-        .expect("resize front");
-        let _ = ctx.stack.pop();
-        dispatch_with_pos(
-            &mut ctx,
-            form_id,
-            &[form_id as i32, elm_array, STAGE_OBJ_BACK, 0],
-            4,
-            &[Value::Int(6)],
-            None,
-            None,
-            None,
-        )
-        .expect("resize back");
-        let _ = ctx.stack.pop();
+        // BACK[5].X_REP.RESIZE(2); BACK[5].X_REP[1] = 320 (FM_INTLIST subops).
+        let mut back_xrep = object_chain(codes::ELM_GLOBAL_BACK, slot);
+        back_xrep.push(codes::ELM_OBJECT_X_REP);
+        let mut resize = back_xrep.clone();
+        resize.push(ELM_INTLIST_RESIZE);
+        vm.exec_command(resize, 0, vm.cfg.fm_void, &mut vec![Value::Int(2)])
+            .expect("BACK[5].X_REP.RESIZE(2)");
+        let mut xrep1 = back_xrep.clone();
+        xrep1.extend([ELM_ARRAY, 1]);
+        vm.exec_assign(xrep1.clone(), 1, Value::Int(320))
+            .expect("BACK[5].X_REP[1] = 320");
 
-        // Create standee on FRONT[5] with wipe_copy = 1
-        dispatch_with_pos(
-            &mut ctx,
-            form_id,
-            &[
-                form_id as i32,
-                elm_array,
-                STAGE_OBJ_FRONT,
-                STAGE_ELM_OBJECT,
-                elm_array,
-                5,
-                object_op::CREATE,
-            ],
-            7,
-            &[Value::Str("bs1_sp13_15".into()), Value::Int(1)],
-            None,
-            None,
-            None,
-        )
-        .expect("create front[5]");
-        let _ = ctx.stack.pop();
-        dispatch_with_pos(
-            &mut ctx,
-            form_id,
-            &[
-                form_id as i32,
-                elm_array,
-                STAGE_OBJ_FRONT,
-                STAGE_ELM_OBJECT,
-                elm_array,
-                5,
-                object_op::WIPE_COPY,
-            ],
-            7,
-            &[],
-            None,
-            Some(Value::Int(1)),
-            Some(1),
-        )
-        .expect("set front[5].wipe_copy = 1");
+        let form = stage_form(&vm);
+        {
+            let st = vm.ctx.globals.stage_forms.get_mut(&form).expect("stage");
+            let front = &mut st.object_lists.get_mut(&1).expect("front")[slot as usize];
+            front.object_type = 2;
+            front.used = true;
+            front.file_name = Some("bs1_sp13_15".into());
+            let back = &mut st.object_lists.get_mut(&0).expect("back")[slot as usize];
+            back.object_type = 2;
+            back.used = true;
+            back.file_name = Some("bs1_sp13_24".into());
+            assert_eq!(back.runtime.prop_event_lists.x_rep.len(), 2);
+        }
 
-        // Create new expression standee on BACK[5] (simulating $$change_bs_face)
-        dispatch_with_pos(
-            &mut ctx,
-            form_id,
-            &[
-                form_id as i32,
-                elm_array,
-                STAGE_OBJ_BACK,
-                STAGE_ELM_OBJECT,
-                elm_array,
-                5,
-                object_op::CREATE,
-            ],
-            7,
-            &[Value::Str("bs1_sp13_24".into()), Value::Int(1)],
-            None,
-            None,
-            None,
-        )
-        .expect("create back[5]");
-        let _ = ctx.stack.pop();
-
-        // Resize X_REP / Y_REP on BACK[5] via intlist_op::RESIZE (2)
-        dispatch_with_pos(
-            &mut ctx,
-            form_id,
-            &[
-                form_id as i32,
-                elm_array,
-                STAGE_OBJ_BACK,
-                STAGE_ELM_OBJECT,
-                elm_array,
-                5,
-                object_op::X_REP,
-                2,
-            ],
-            8,
-            &[Value::Int(2)],
-            None,
-            None,
-            Some(0),
-        )
-        .expect("back[5].x_rep.resize(2)");
-        let _ = ctx.stack.pop();
-
-        // Set X_REP[1] = 320 on BACK[5]
-        dispatch_with_pos(
-            &mut ctx,
-            form_id,
-            &[
-                form_id as i32,
-                elm_array,
-                STAGE_OBJ_BACK,
-                STAGE_ELM_OBJECT,
-                elm_array,
-                5,
-                object_op::X_REP,
-                elm_array,
-                1,
-            ],
-            9,
-            &[],
-            None,
-            Some(Value::Int(320)),
-            Some(1),
-        )
-        .expect("back[5].x_rep[1] = 320");
-
-        // Run stage_wipe_object_lists: BACK[5] MUST replace FRONT[5] even though FRONT[5].wipe_copy == 1!
-        let mut st = ctx.globals.stage_forms.remove(&form_id).unwrap();
-        stage_wipe_object_lists(&mut ctx, &mut st);
-        ctx.globals.stage_forms.insert(form_id, st);
-
-        dispatch_with_pos(
-            &mut ctx,
-            form_id,
-            &[
-                form_id as i32,
-                elm_array,
-                STAGE_OBJ_FRONT,
-                STAGE_ELM_OBJECT,
-                elm_array,
-                5,
-                object_op::GET_FILE_NAME,
-            ],
-            7,
-            &[],
-            Some(20),
-            None,
-            Some(0),
-        )
-        .expect("get front[5].file_name");
-        assert_eq!(
-            ctx.stack.pop(),
-            Some(Value::Str("bs1_sp13_24".to_string()))
+        crate::runtime::forms::stage::apply_stage_wipe(
+            &mut vm.ctx,
+            i32::MIN,
+            i32::MAX,
+            i32::MIN,
+            i32::MAX,
         );
 
-        dispatch_with_pos(
-            &mut ctx,
-            form_id,
-            &[
-                form_id as i32,
-                elm_array,
-                STAGE_OBJ_FRONT,
-                STAGE_ELM_OBJECT,
-                elm_array,
-                5,
-                object_op::X_REP,
-                elm_array,
-                1,
-            ],
-            9,
-            &[],
-            Some(10),
-            None,
-            Some(0),
-        )
-        .expect("get front[5].x_rep[1]");
-        assert_eq!(ctx.stack.pop(), Some(Value::Int(320)));
+        let st = &vm.ctx.globals.stage_forms[&form];
+        let front = &st.object_lists[&1][slot as usize];
+        assert_eq!(front.file_name.as_deref(), Some("bs1_sp13_24"));
+        assert_eq!(front.runtime.prop_event_lists.x_rep.len(), 2);
+        assert_eq!(front.runtime.prop_event_lists.x_rep[1].get_value(), 320);
+        let back = &st.object_lists[&0][slot as usize];
+        assert_eq!(back.object_type, 0, "BACK slot cleared after promotion");
+
+        // Read the promoted value back through the VM property route.
+        let mut front_xrep1 = object_chain(codes::ELM_GLOBAL_FRONT, slot);
+        front_xrep1.extend([codes::ELM_OBJECT_X_REP, ELM_ARRAY, 1]);
+        vm.exec_property(front_xrep1).expect("FRONT[5].X_REP[1]");
+        assert_eq!(vm.pop_int().unwrap(), 320);
+    }
+
+    /// An unprepared BACK must not erase a WIPE_COPY FRONT standee.
+    #[test]
+    fn wipe_keeps_wipe_copy_front_when_back_is_empty() {
+        let mut vm = test_vm();
+        let slot = 3;
+        let mut front_wipe_copy = object_chain(codes::ELM_GLOBAL_FRONT, slot);
+        front_wipe_copy.push(codes::ELM_OBJECT_WIPE_COPY);
+        vm.exec_assign(front_wipe_copy, 1, Value::Int(1)).unwrap();
+        let form = stage_form(&vm);
+        {
+            let st = vm.ctx.globals.stage_forms.get_mut(&form).unwrap();
+            let front = &mut st.object_lists.get_mut(&1).unwrap()[slot as usize];
+            front.object_type = 2;
+            front.used = true;
+            front.file_name = Some("bs1_sp13_15".into());
+        }
+        crate::runtime::forms::stage::apply_stage_wipe(
+            &mut vm.ctx,
+            i32::MIN,
+            i32::MAX,
+            i32::MIN,
+            i32::MAX,
+        );
+        let st = &vm.ctx.globals.stage_forms[&form];
+        assert_eq!(
+            st.object_lists[&1][slot as usize].file_name.as_deref(),
+            Some("bs1_sp13_15")
+        );
     }
 }
