@@ -162,11 +162,6 @@ impl SwitchHost {
             self.host.renderer_mut().dump_next_frame(PathBuf::from(path));
         }
         self.frame += 1;
-        // Auto-hide the mouse cursor after 2.5 seconds (150 frames @ 60fps) of no stick movement.
-        if self.cursor_active && self.frame.saturating_sub(self.cursor_last_active_tick) > 150 {
-            self.cursor_active = false;
-            self.host.vm_mut().ctx.globals.script.cursor_runtime_visible = false;
-        }
         let running = self.host.step(dt_ms);
         if self.frame % GLOBAL_SAVE_INTERVAL == 0 && !self.host.is_busy_transition_or_movie() {
             self.global_fingerprint = self.host.persist_global_if_changed(Some(self.global_fingerprint));
@@ -200,11 +195,11 @@ impl SwitchHost {
                     .clamp(0.0, f64::from(logical_w) - 1.0);
                 self.virtual_mouse_y = (self.virtual_mouse_y - norm_dy * step_px)
                     .clamp(0.0, f64::from(logical_h) - 1.0);
-                self.host.mouse_move(self.virtual_mouse_x, self.virtual_mouse_y);
                 self.cursor_active = true;
                 self.cursor_last_active_tick = self.frame;
                 self.host.vm_mut().ctx.globals.script.cursor_runtime_visible = true;
                 self.host.vm_mut().ctx.input.note_keyboard_mouse_activity();
+                self.host.mouse_move(self.virtual_mouse_x, self.virtual_mouse_y);
             }
         } else if stick == 1 {
             // Right Stick: Vertical wheel (Backlog scrolling)

@@ -21,6 +21,10 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Run siglus_scene_vm regression tests
+        run: |
+          cargo test -p siglus_scene_vm --lib call_frame_save_metadata_tests -- --nocapture
+
       - name: Build NRO and NSO
         run: |
           make -C platform/switch/runtime

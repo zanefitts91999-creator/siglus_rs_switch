@@ -4974,10 +4974,12 @@ impl<'a> SceneVm<'a> {
         ]
     }
 
-    fn default_user_prop_cell(&self, prop_id: u16) -> UserPropCell {
-        let (form, size) = self
-            .user_prop_decl(prop_id)
-            .unwrap_or((self.cfg.fm_list, 0));
+    fn default_user_prop_cell_for_decl(
+        &self,
+        prop_id: u16,
+        form: i32,
+        size: usize,
+    ) -> UserPropCell {
         let mut cell = UserPropCell::new(form, self.default_user_prop_element(prop_id, form));
         if form == self.cfg.fm_intlist {
             cell.int_list = vec![0; size];
@@ -4996,6 +4998,13 @@ impl<'a> SceneVm<'a> {
             cell.list_items = items;
         }
         cell
+    }
+
+    fn default_user_prop_cell(&self, prop_id: u16) -> UserPropCell {
+        let (form, size) = self
+            .user_prop_decl(prop_id)
+            .unwrap_or((self.cfg.fm_list, 0));
+        self.default_user_prop_cell_for_decl(prop_id, form, size)
     }
 
     fn user_prop_cell_from_value(
@@ -9003,28 +9012,82 @@ impl<'a> SceneVm<'a> {
         Ok(())
     }
 
+    fn build_scene_prop_list_for_stream(
+        &self,
+        shared: usize,
+        stream: Option<&SceneStream<'a>>,
+        locals_map: &BTreeMap<u16, UserPropCell>,
+    ) -> Vec<(i32, UserPropCell)> {
+        let mut props: Vec<(i32, UserPropCell)> = Vec::new();
+        if let Some(stream) = stream {
+            let scene_prop_cnt = stream.header.scn_prop_cnt.max(0) as usize;
+            let list_ofs = stream.header.scn_prop_list_ofs.max(0) as usize;
+            for idx in 0..scene_prop_cnt {
+                let prop_id = (shared + idx) as u16;
+                if let Some(cell) = locals_map.get(&prop_id).cloned() {
+                    props.push((idx as i32, cell));
+                } else if let Some(off) = list_ofs.checked_add(idx * 8)
+                    && off + 8 <= stream.chunk.len()
+                {
+                    let form =
+                        i32::from_le_bytes(stream.chunk[off..off + 4].try_into().unwrap());
+                    let size = i32::from_le_bytes(stream.chunk[off + 4..off + 8].try_into().unwrap())
+                        .max(0) as usize;
+                    props.push((
+                        idx as i32,
+                        self.default_user_prop_cell_for_decl(prop_id, form, size),
+                    ));
+                }
+            }
+        } else {
+            for (&prop_id, cell) in locals_map {
+                if (prop_id as usize) >= shared {
+                    let idx = (prop_id as usize) - shared;
+                    props.push((idx as i32, cell.clone()));
+                }
+            }
+        }
+        props
+    }
+
     fn write_cpp_current_scene_prop_lists(
         &self,
         w: &mut crate::original_save::OriginalStreamWriter,
     ) {
         let shared = self.shared_user_prop_count();
-        let mut props: Vec<(i32, UserPropCell)> = Vec::new();
-        let scene_prop_cnt = self.stream.header.scn_prop_cnt.max(0) as usize;
-        for idx in 0..scene_prop_cnt {
-            let prop_id = (shared + idx) as u16;
-            if let Some(cell) = self.user_props.get(&prop_id).cloned() {
-                props.push((idx as i32, cell));
-            } else if let Some((_, _)) = self.user_prop_decl(prop_id) {
-                props.push((idx as i32, self.default_user_prop_cell(prop_id)));
+        let mut lists: Vec<(String, Vec<(i32, UserPropCell)>)> = Vec::new();
+
+        for (&scn_no, locals_map) in &self.scene_user_props {
+            if Some(scn_no) == self.current_scene_no || locals_map.is_empty() {
+                continue;
+            }
+            let Some(scene_name) = self
+                .scene_pck_cache
+                .as_ref()
+                .and_then(|pck| pck.find_scene_name(scn_no))
+                .map(ToOwned::to_owned)
+            else {
+                continue;
+            };
+            let stream = self.scene_stream_cache.get(&scn_no);
+            let props = self.build_scene_prop_list_for_stream(shared, stream, locals_map);
+            if !props.is_empty() {
+                lists.push((scene_name, props));
             }
         }
-        if props.is_empty() {
-            w.push_i32(0);
-            return;
+
+        let cur_props =
+            self.build_scene_prop_list_for_stream(shared, Some(&self.stream), &self.user_props);
+        if !cur_props.is_empty() {
+            let cur_name = self.current_scene_name.as_deref().unwrap_or("").to_string();
+            lists.push((cur_name, cur_props));
         }
-        w.push_i32(1);
-        w.push_str(self.current_scene_name.as_deref().unwrap_or(""));
-        w.push_fixed_items(&props, |w, (id, cell)| self.write_cpp_prop(w, *id, cell));
+
+        w.push_i32(lists.len() as i32);
+        for (scene_name, props) in &lists {
+            w.push_str(scene_name);
+            w.push_fixed_items(props, |w, (id, cell)| self.write_cpp_prop(w, *id, cell));
+        }
     }
 
     fn read_cpp_scene_prop_lists(
@@ -9032,13 +9095,23 @@ impl<'a> SceneVm<'a> {
         rd: &mut crate::original_save::OriginalStreamReader<'_>,
         current_scene_name: &str,
     ) -> Result<()> {
+        let _ = self.ensure_scene_pck_cache();
         let shared = self.shared_user_prop_count();
         if rd.layout.is_indexed() {
             let lists = rd.fixed_items(|rd| rd.fixed_items(|rd| self.read_cpp_prop(rd)))?;
-            let scene_no = self.ctx.lookup_scene_no(current_scene_name).unwrap_or(-1);
-            if let Some(props) = lists.into_iter().nth(scene_no as usize) {
-                for (idx, (_, cell)) in props.into_iter().enumerate() {
-                    self.user_props.insert((shared + idx) as u16, cell);
+            let current_scene_no = self.ctx.lookup_scene_no(current_scene_name).unwrap_or(-1);
+            for (scn_no, props) in lists.into_iter().enumerate() {
+                if scn_no as i32 == current_scene_no {
+                    for (idx, (stored_id, cell)) in props.into_iter().enumerate() {
+                        let local_idx = usize::try_from(stored_id).unwrap_or(idx);
+                        self.user_props.insert((shared + local_idx) as u16, cell);
+                    }
+                } else if !props.is_empty() {
+                    let entry = self.scene_user_props.entry(scn_no).or_default();
+                    for (idx, (stored_id, cell)) in props.into_iter().enumerate() {
+                        let local_idx = usize::try_from(stored_id).unwrap_or(idx);
+                        entry.insert((shared + local_idx) as u16, cell);
+                    }
                 }
             }
             return Ok(());
@@ -9047,9 +9120,25 @@ impl<'a> SceneVm<'a> {
         for _ in 0..scene_prop_cnt {
             let scene_name = rd.string()?;
             let props = rd.fixed_items(|rd| self.read_cpp_prop(rd))?;
-            if scene_name == current_scene_name {
-                for (idx, (_stored_id, cell)) in props.into_iter().enumerate() {
-                    self.user_props.insert((shared + idx) as u16, cell);
+            if scene_name == current_scene_name || siglus_name_eq(&scene_name, current_scene_name) {
+                for (idx, (stored_id, cell)) in props.into_iter().enumerate() {
+                    let local_idx = usize::try_from(stored_id).unwrap_or(idx);
+                    self.user_props.insert((shared + local_idx) as u16, cell);
+                }
+            } else if let Some(scn_no) = self
+                .scene_pck_cache
+                .as_ref()
+                .and_then(|pck| Self::find_scene_no_by_name(pck, &scene_name))
+                .or_else(|| {
+                    self.ctx
+                        .lookup_scene_no(&scene_name)
+                        .and_then(|n| usize::try_from(n).ok())
+                })
+            {
+                let entry = self.scene_user_props.entry(scn_no).or_default();
+                for (idx, (stored_id, cell)) in props.into_iter().enumerate() {
+                    let local_idx = usize::try_from(stored_id).unwrap_or(idx);
+                    entry.insert((shared + local_idx) as u16, cell);
                 }
             }
         }
@@ -12648,8 +12737,10 @@ impl<'a> SceneVm<'a> {
         // points, and the stale save point. The loaded scene re-establishes its
         // own context; without this, when the loaded scene eventually issues a
         // RETURN we'd pop back into the orphaned save/load menu excall frame.
+        self.stash_current_scene_user_props();
+        let prev_scene_user_props = std::mem::take(&mut self.scene_user_props);
+        self.user_props.clear();
         self.scene_stack.clear();
-        self.scene_user_props.clear();
         self.sel_point_stack.clear();
         self.save_point = None;
         self.ctx.local_save_snapshot = None;
@@ -12714,6 +12805,7 @@ impl<'a> SceneVm<'a> {
         self.ctx.wait = runtime::wait::VmWait::default();
         self.halted = false;
         self.delayed_ret_form = None;
+        self.heal_legacy_scene_user_props_after_load(prev_scene_user_props);
         // C++ `C_elm_stage::load` / `C_elm_mwnd::load` end by calling each
         // object's `restruct_type()` to rebuild type-specific runtime resources.
         // Rust's sprite, image, movie, weather and mesh handles are not stored in
@@ -12721,6 +12813,75 @@ impl<'a> SceneVm<'a> {
         self.restore_runtime_bindings_after_load();
         self.ctx.mark_runtime_load_completed();
         Ok(())
+    }
+
+    /// Legacy save files created before cross-scene `scene_user_props` serialization
+    /// only saved `current_scene_name`'s local properties (which for scenario scenes
+    /// is empty), leaving library scenes such as `__lib_bs`, `__lib_wipe`, and
+    /// `__lib_image` uninitialized after load. Self-heal those library tables when
+    /// loading a legacy save.
+    fn heal_legacy_scene_user_props_after_load(
+        &mut self,
+        prev_scene_user_props: BTreeMap<usize, BTreeMap<u16, UserPropCell>>,
+    ) {
+        if !self.scene_user_props.is_empty() {
+            return;
+        }
+        for (scn_no, props) in prev_scene_user_props {
+            if Some(scn_no) != self.current_scene_no && !props.is_empty() {
+                self.scene_user_props.entry(scn_no).or_insert(props);
+            }
+        }
+        let lib_bs_scn_no = self
+            .scene_pck_cache
+            .as_ref()
+            .and_then(|pck| Self::find_scene_no_by_name(pck, "__lib_bs"));
+        let needs_lib_init = lib_bs_scn_no.is_some_and(|scn_no| {
+            self.scene_user_props
+                .get(&scn_no)
+                .is_none_or(|props| props.is_empty())
+        });
+        if needs_lib_init {
+            for init_cmd in [
+                "$$init_wipe_data",
+                "$$init_image_offset_data",
+                "$$set_image_offset_data_default",
+                "$$set_bs_data_default",
+                "$$set_bs_pos_x_default",
+                "$$set_face_data_default",
+                "$$set_config_charakoe_list",
+                "$$set_extra_chapter_list",
+                "$$set_extra_cg_list",
+                "$$set_extra_music_list",
+                "$$set_image_block_default",
+                "$$init_bs_scene_data",
+                "$$init_time_control",
+            ] {
+                let _ =
+                    self.run_scene_user_cmd_inline(None, init_cmd, &[], self.cfg.fm_void, false);
+            }
+            if let Some(lib_sys_scn_no) = self
+                .scene_pck_cache
+                .as_ref()
+                .and_then(|pck| Self::find_scene_no_by_name(pck, "__lib_system"))
+            {
+                let shared = self.shared_user_prop_count();
+                let prop_id = shared as u16;
+                let mut cell =
+                    UserPropCell::new(self.cfg.fm_int, self.default_user_prop_element(prop_id, self.cfg.fm_int));
+                cell.int_value = 1;
+                self.scene_user_props
+                    .entry(lib_sys_scn_no)
+                    .or_default()
+                    .insert(prop_id, cell);
+            }
+        }
+        if !self.scene_user_props.is_empty() {
+            let healed_stream = self.build_original_local_stream();
+            if let Some(snap) = self.ctx.local_save_snapshot.as_mut() {
+                snap.local_stream = healed_stream;
+            }
+        }
     }
 
     /// Rebuild every loaded object's type-specific runtime backend, including
@@ -15940,5 +16101,272 @@ mod call_frame_save_metadata_tests {
         assert_eq!(restored.return_pc, 0x1234);
         assert_eq!(restored.return_scene_name.as_deref(), Some("caller_scene"));
         assert_eq!(restored.return_line_no, 2605);
+    }
+
+    #[test]
+    fn cross_scene_user_props_round_trip_in_save_stream() {
+        let chunk = Box::leak(empty_scene_chunk().into_boxed_slice());
+        let stream = SceneStream::new(chunk).expect("empty scene stream");
+        let mut vm = SceneVm::new(stream, CommandContext::new(PathBuf::from(".")));
+        vm.current_scene_name = "010_プロローグ0702".to_string();
+
+        let shared = vm.shared_user_prop_count();
+        let prop_int_id = shared as u16;
+        let prop_intlist_id = (shared + 1) as u16;
+        let prop_strlist_id = (shared + 2) as u16;
+
+        let mut cell_int = UserPropCell::new(
+            vm.cfg.fm_int,
+            vm.default_user_prop_element(prop_int_id, vm.cfg.fm_int),
+        );
+        cell_int.int_value = 1;
+
+        let mut cell_intlist = UserPropCell::new(
+            vm.cfg.fm_intlist,
+            vm.default_user_prop_element(prop_intlist_id, vm.cfg.fm_intlist),
+        );
+        cell_intlist.int_list = vec![0, 500, 1000, 1500];
+
+        let mut cell_strlist = UserPropCell::new(
+            vm.cfg.fm_strlist,
+            vm.default_user_prop_element(prop_strlist_id, vm.cfg.fm_strlist),
+        );
+        cell_strlist.str_list = vec!["sp13_24".to_string(), "sp11_13".to_string()];
+
+        let mut lib_bs_map = std::collections::HashMap::new();
+        lib_bs_map.insert(prop_int_id, cell_int);
+        lib_bs_map.insert(prop_intlist_id, cell_intlist);
+        lib_bs_map.insert(prop_strlist_id, cell_strlist);
+        vm.scene_user_props.insert(454, lib_bs_map);
+        vm.scene_name_overrides
+            .insert(454, "__lib_bs".to_string());
+
+        let mut writer = OriginalStreamWriter::new();
+        vm.write_cpp_current_scene_prop_lists(&mut writer);
+        let bytes = writer.into_inner();
+
+        let chunk2 = Box::leak(empty_scene_chunk().into_boxed_slice());
+        let stream2 = SceneStream::new(chunk2).expect("empty scene stream");
+        let mut vm2 = SceneVm::new(stream2, CommandContext::new(PathBuf::from(".")));
+        vm2.current_scene_name = "010_プロローグ0702".to_string();
+        vm2.scene_name_overrides
+            .insert(454, "__lib_bs".to_string());
+
+        let mut reader = OriginalStreamReader::new(&bytes);
+        vm2.read_cpp_scene_prop_lists(&mut reader)
+            .expect("read scene prop lists");
+
+        let restored_bs = vm2
+            .scene_user_props
+            .get(&454)
+            .expect("__lib_bs scene_user_props restored");
+        assert_eq!(restored_bs[&prop_int_id].int_value, 1);
+        assert_eq!(
+            restored_bs[&prop_intlist_id].int_list,
+            vec![0, 500, 1000, 1500]
+        );
+        assert_eq!(
+            restored_bs[&prop_strlist_id].str_list,
+            vec!["sp13_24".to_string(), "sp11_13".to_string()]
+        );
+    }
+
+    #[test]
+    fn stage_wipe_promotes_back_prepared_object_when_front_wipe_copy_is_one() {
+        use crate::runtime::forms::codes::{
+            STAGE_ELM_OBJECT, STAGE_OBJ_BACK, STAGE_OBJ_FRONT, object_op,
+        };
+        use crate::runtime::forms::stage::{dispatch_with_pos, stage_wipe_object_lists};
+
+        let mut ctx = CommandContext::new(PathBuf::from("."));
+        let form_id = ctx.ids.form_global_stage;
+        let elm_array = ctx.ids.elm_array;
+
+        // Resize FRONT and BACK object lists to 6
+        dispatch_with_pos(
+            &mut ctx,
+            form_id,
+            &[form_id as i32, elm_array, STAGE_OBJ_FRONT, 0],
+            4,
+            &[Value::Int(6)],
+            None,
+            None,
+            None,
+        )
+        .expect("resize front");
+        let _ = ctx.stack.pop();
+        dispatch_with_pos(
+            &mut ctx,
+            form_id,
+            &[form_id as i32, elm_array, STAGE_OBJ_BACK, 0],
+            4,
+            &[Value::Int(6)],
+            None,
+            None,
+            None,
+        )
+        .expect("resize back");
+        let _ = ctx.stack.pop();
+
+        // Create standee on FRONT[5] with wipe_copy = 1
+        dispatch_with_pos(
+            &mut ctx,
+            form_id,
+            &[
+                form_id as i32,
+                elm_array,
+                STAGE_OBJ_FRONT,
+                STAGE_ELM_OBJECT,
+                elm_array,
+                5,
+                object_op::CREATE,
+            ],
+            7,
+            &[Value::Str("bs1_sp13_15".into()), Value::Int(1)],
+            None,
+            None,
+            None,
+        )
+        .expect("create front[5]");
+        let _ = ctx.stack.pop();
+        dispatch_with_pos(
+            &mut ctx,
+            form_id,
+            &[
+                form_id as i32,
+                elm_array,
+                STAGE_OBJ_FRONT,
+                STAGE_ELM_OBJECT,
+                elm_array,
+                5,
+                object_op::WIPE_COPY,
+            ],
+            7,
+            &[],
+            None,
+            Some(Value::Int(1)),
+            Some(1),
+        )
+        .expect("set front[5].wipe_copy = 1");
+
+        // Create new expression standee on BACK[5] (simulating $$change_bs_face)
+        dispatch_with_pos(
+            &mut ctx,
+            form_id,
+            &[
+                form_id as i32,
+                elm_array,
+                STAGE_OBJ_BACK,
+                STAGE_ELM_OBJECT,
+                elm_array,
+                5,
+                object_op::CREATE,
+            ],
+            7,
+            &[Value::Str("bs1_sp13_24".into()), Value::Int(1)],
+            None,
+            None,
+            None,
+        )
+        .expect("create back[5]");
+        let _ = ctx.stack.pop();
+
+        // Resize X_REP / Y_REP on BACK[5] via intlist_op::RESIZE (2)
+        dispatch_with_pos(
+            &mut ctx,
+            form_id,
+            &[
+                form_id as i32,
+                elm_array,
+                STAGE_OBJ_BACK,
+                STAGE_ELM_OBJECT,
+                elm_array,
+                5,
+                object_op::X_REP,
+                2,
+            ],
+            8,
+            &[Value::Int(2)],
+            None,
+            None,
+            Some(0),
+        )
+        .expect("back[5].x_rep.resize(2)");
+        let _ = ctx.stack.pop();
+
+        // Set X_REP[1] = 320 on BACK[5]
+        dispatch_with_pos(
+            &mut ctx,
+            form_id,
+            &[
+                form_id as i32,
+                elm_array,
+                STAGE_OBJ_BACK,
+                STAGE_ELM_OBJECT,
+                elm_array,
+                5,
+                object_op::X_REP,
+                elm_array,
+                1,
+            ],
+            9,
+            &[],
+            None,
+            Some(Value::Int(320)),
+            Some(1),
+        )
+        .expect("back[5].x_rep[1] = 320");
+
+        // Run stage_wipe_object_lists: BACK[5] MUST replace FRONT[5] even though FRONT[5].wipe_copy == 1!
+        let mut st = ctx.globals.stage_forms.remove(&form_id).unwrap();
+        stage_wipe_object_lists(&mut ctx, &mut st);
+        ctx.globals.stage_forms.insert(form_id, st);
+
+        dispatch_with_pos(
+            &mut ctx,
+            form_id,
+            &[
+                form_id as i32,
+                elm_array,
+                STAGE_OBJ_FRONT,
+                STAGE_ELM_OBJECT,
+                elm_array,
+                5,
+                object_op::GET_FILE_NAME,
+            ],
+            7,
+            &[],
+            Some(20),
+            None,
+            Some(0),
+        )
+        .expect("get front[5].file_name");
+        assert_eq!(
+            ctx.stack.pop(),
+            Some(Value::Str("bs1_sp13_24".to_string()))
+        );
+
+        dispatch_with_pos(
+            &mut ctx,
+            form_id,
+            &[
+                form_id as i32,
+                elm_array,
+                STAGE_OBJ_FRONT,
+                STAGE_ELM_OBJECT,
+                elm_array,
+                5,
+                object_op::X_REP,
+                elm_array,
+                1,
+            ],
+            9,
+            &[],
+            Some(10),
+            None,
+            Some(0),
+        )
+        .expect("get front[5].x_rep[1]");
+        assert_eq!(ctx.stack.pop(), Some(Value::Int(320)));
     }
 }

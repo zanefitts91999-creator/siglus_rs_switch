@@ -2348,8 +2348,15 @@ fn stage_wipe_object_lists(
     begin_layer: i32,
     end_layer: i32,
 ) {
-    let front_len = st.object_lists.get(&1).map(|v| v.len()).unwrap_or(0);
+    let back_len = st.object_lists.get(&0).map(|v| v.len()).unwrap_or(0);
+    let front_len = st
+        .object_lists
+        .get(&1)
+        .map(|v| v.len())
+        .unwrap_or(0)
+        .max(back_len);
     extend_stage_object_list_at_least(ctx, st, 0, front_len);
+    extend_stage_object_list_at_least(ctx, st, 1, front_len);
     extend_stage_object_list_at_least(ctx, st, 2, front_len);
 
     for idx in 0..front_len {
@@ -2372,16 +2379,25 @@ fn stage_wipe_object_lists(
             .cloned()
             .unwrap_or_default();
         let (front_order, front_layer) = object_sorter(ctx, &front);
+        let (back_order, back_layer) = object_sorter(ctx, &back);
         let back_prepared = object_is_prepared_for_stage_wipe(&back);
-        if sorter_in_range(
+        let front_in_range = sorter_in_range(
             front_order,
             front_layer,
             begin_order,
             begin_layer,
             end_order,
             end_layer,
-        ) || back_prepared
-        {
+        );
+        let back_in_range = sorter_in_range(
+            back_order,
+            back_layer,
+            begin_order,
+            begin_layer,
+            end_order,
+            end_layer,
+        );
+        if front_in_range || (back_prepared && back_in_range) {
             if config_button_trace_enabled_local() {
                 eprintln!(
                     "[SG_DEBUG][CONFIG_BUTTON_TRACE][STAGE_WIPE] object_slot idx={} front_file={} front_order={} front_layer={} back_file={} back_prepared={} front_wipe_copy={} back_wipe_erase={} range=({},{})->({},{})",
@@ -2401,19 +2417,12 @@ fn stage_wipe_object_lists(
             }
             copy_root_object_for_stage_wipe(ctx, st, 2, idx, &front);
 
-            let should_promote_back = if back_prepared {
-                object_wipe_copy_value(ctx, &front) == 0
-            } else {
-                object_wipe_erase_value(ctx, &back) == 1
-                    || object_wipe_erase_value(ctx, &front) == 1
-                    || (end_order == i32::MAX && object_wipe_copy_value(ctx, &front) == 0)
-            };
-
-            if should_promote_back {
+            if object_wipe_copy_value(ctx, &front) == 0
+                || back_prepared
+                || object_wipe_erase_value(ctx, &back) == 1
+                || object_wipe_erase_value(ctx, &front) == 1
+            {
                 copy_root_object_for_stage_wipe(ctx, st, 1, idx, &back);
-                let list = st.object_lists.get_mut(&0).unwrap();
-                clear_root_object_for_stage_wipe(ctx, list, 0, idx);
-            } else if back_prepared {
                 let list = st.object_lists.get_mut(&0).unwrap();
                 clear_root_object_for_stage_wipe(ctx, list, 0, idx);
             }
@@ -8107,7 +8116,25 @@ fn dispatch_object_state_op(
     }
 
     if let Some(rep_list) = obj.rep_int_event_list_by_rep_op_mut(&ctx.ids, op) {
-        let (arr_idx, t) = split_property_list_tail(ctx, tail, al_id, ret_form, rhs, script_args);
+        let is_rep_list_command = tail.len() == 1
+            && rhs.is_none()
+            && match tail[0] {
+                intlist_op::RESIZE | int_event_list_op::RESIZE => {
+                    script_args.len() == 1 && matches!(ret_form, None | Some(0))
+                }
+                intlist_op::SETS => script_args.len() >= 2 && matches!(ret_form, None | Some(0)),
+                intlist_op::CLEAR => !script_args.is_empty() && matches!(ret_form, None | Some(0)),
+                intlist_op::INIT => script_args.is_empty() && matches!(ret_form, None | Some(0)),
+                intlist_op::GET_SIZE => {
+                    script_args.is_empty() && matches!(ret_form, Some(rf) if rf != 0)
+                }
+                _ => false,
+            };
+        let (arr_idx, t) = if is_rep_list_command {
+            (None, tail)
+        } else {
+            split_property_list_tail(ctx, tail, al_id, ret_form, rhs, script_args)
+        };
 
         if let Some(rep_idx) = arr_idx {
             if rep_idx < 0 {
@@ -8184,9 +8211,32 @@ fn dispatch_object_state_op(
                 }
                 return true;
             }
-        } else if t.len() == 1 && t[0] == int_event_list_op::RESIZE {
+        } else if t.len() == 1
+            && (t[0] == int_event_list_op::RESIZE || t[0] == intlist_op::RESIZE)
+            && script_args.len() <= 1
+        {
             let n = script_args.first().and_then(as_i64).unwrap_or(0).max(0) as usize;
             rep_list.resize_with(n, || IntEvent::new(object_event_list_default(&ctx.ids, op)));
+            ctx.stack.push(Value::Int(0));
+            return true;
+        } else if t.len() == 1 && t[0] == intlist_op::INIT {
+            rep_list.clear();
+            ctx.stack.push(Value::Int(0));
+            return true;
+        } else if t.len() == 1 && t[0] == intlist_op::GET_SIZE {
+            ctx.stack.push(Value::Int(rep_list.len() as i64));
+            return true;
+        } else if t.len() == 1 && t[0] == intlist_op::SETS {
+            let start = script_args.first().and_then(as_i64).unwrap_or(0).max(0) as usize;
+            for (offset, value) in script_args.iter().skip(1).enumerate() {
+                let ui = start + offset;
+                if rep_list.len() <= ui {
+                    rep_list.resize_with(ui + 1, || {
+                        IntEvent::new(object_event_list_default(&ctx.ids, op))
+                    });
+                }
+                rep_list[ui].set_value(value.as_i64().unwrap_or(0) as i32);
+            }
             ctx.stack.push(Value::Int(0));
             return true;
         }
