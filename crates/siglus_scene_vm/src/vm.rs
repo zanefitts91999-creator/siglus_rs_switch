@@ -9066,6 +9066,7 @@ impl<'a> SceneVm<'a> {
                 .as_ref()
                 .and_then(|pck| pck.find_scene_name(scn_no))
                 .map(ToOwned::to_owned)
+                .or_else(|| self.ctx.lookup_scene_name(scn_no as i64).ok().flatten())
             else {
                 continue;
             };
@@ -9101,7 +9102,7 @@ impl<'a> SceneVm<'a> {
             let lists = rd.fixed_items(|rd| rd.fixed_items(|rd| self.read_cpp_prop(rd)))?;
             let current_scene_no = self.ctx.lookup_scene_no(current_scene_name).unwrap_or(-1);
             for (scn_no, props) in lists.into_iter().enumerate() {
-                if scn_no as i32 == current_scene_no {
+                if scn_no as i64 == current_scene_no {
                     for (idx, (stored_id, cell)) in props.into_iter().enumerate() {
                         let local_idx = usize::try_from(stored_id).unwrap_or(idx);
                         self.user_props.insert((shared + local_idx) as u16, cell);
@@ -9132,6 +9133,7 @@ impl<'a> SceneVm<'a> {
                 .or_else(|| {
                     self.ctx
                         .lookup_scene_no(&scene_name)
+                        .ok()
                         .and_then(|n| usize::try_from(n).ok())
                 })
             {
@@ -16108,7 +16110,10 @@ mod call_frame_save_metadata_tests {
         let chunk = Box::leak(empty_scene_chunk().into_boxed_slice());
         let stream = SceneStream::new(chunk).expect("empty scene stream");
         let mut vm = SceneVm::new(stream, CommandContext::new(PathBuf::from(".")));
-        vm.current_scene_name = "010_プロローグ0702".to_string();
+        vm.current_scene_name = Some("010_プロローグ0702".to_string());
+        vm.ctx
+            .scene_names
+            .insert(454, "__lib_bs".to_string());
 
         let shared = vm.shared_user_prop_count();
         let prop_int_id = shared as u16;
@@ -16133,13 +16138,11 @@ mod call_frame_save_metadata_tests {
         );
         cell_strlist.str_list = vec!["sp13_24".to_string(), "sp11_13".to_string()];
 
-        let mut lib_bs_map = std::collections::HashMap::new();
+        let mut lib_bs_map = std::collections::BTreeMap::new();
         lib_bs_map.insert(prop_int_id, cell_int);
         lib_bs_map.insert(prop_intlist_id, cell_intlist);
         lib_bs_map.insert(prop_strlist_id, cell_strlist);
         vm.scene_user_props.insert(454, lib_bs_map);
-        vm.scene_name_overrides
-            .insert(454, "__lib_bs".to_string());
 
         let mut writer = OriginalStreamWriter::new();
         vm.write_cpp_current_scene_prop_lists(&mut writer);
@@ -16148,12 +16151,13 @@ mod call_frame_save_metadata_tests {
         let chunk2 = Box::leak(empty_scene_chunk().into_boxed_slice());
         let stream2 = SceneStream::new(chunk2).expect("empty scene stream");
         let mut vm2 = SceneVm::new(stream2, CommandContext::new(PathBuf::from(".")));
-        vm2.current_scene_name = "010_プロローグ0702".to_string();
-        vm2.scene_name_overrides
+        vm2.current_scene_name = Some("010_プロローグ0702".to_string());
+        vm2.ctx
+            .scene_names
             .insert(454, "__lib_bs".to_string());
 
         let mut reader = OriginalStreamReader::new(&bytes);
-        vm2.read_cpp_scene_prop_lists(&mut reader)
+        vm2.read_cpp_scene_prop_lists(&mut reader, "010_プロローグ0702")
             .expect("read scene prop lists");
 
         let restored_bs = vm2

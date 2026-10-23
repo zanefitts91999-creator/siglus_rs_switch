@@ -23,6 +23,7 @@ jobs:
 
       - name: Run siglus_scene_vm regression tests
         run: |
+          apt-get update && apt-get install -y --no-install-recommends pkg-config libasound2-dev libudev-dev
           cargo test -p siglus_scene_vm --lib call_frame_save_metadata_tests -- --nocapture
 
       - name: Build NRO and NSO
